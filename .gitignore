@@ -1,0 +1,6 @@
+*.html
+*.csv
+*.xlsx
+.Rhistory
+.Rproj.user
+.DS_Store

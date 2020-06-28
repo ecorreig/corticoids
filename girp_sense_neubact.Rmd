@@ -1,0 +1,332 @@
+---
+title: "grip_sense_neubact"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+require(gmodels)
+require(MatchIt)
+require(optmatch)
+require(glmnet)
+require(ggplot2)
+require(cvAUC)
+require(survival)
+require(survminer)
+require(reshape2)
+source('corbes_roc.R')
+require(ggbiplot)
+require(mixOmics)
+set.seed(1809)
+```
+
+Import clean data
+===
+
+```{r}
+grip = read.csv('grip_net.csv')
+```
+
+
+```{r}
+clean=complete.cases(grip)
+cgrip=grip[clean,]
+```
+
+Netegem variables que no necessitem i formatem la resta:
+
+```{r}
+
+cgrip$macrolido[cgrip$macrolido>1]<-1
+
+ncgg = cgrip[,-c(1,11,32:34,65,67,68)]
+
+
+factorials = c(1,3,5,11,16:20,24,26:50,52:53,55:57,59:60)
+
+for (i in factorials){
+  ncgg[,i]=as.factor(ncgg[,i])
+}
+
+
+
+ncg=ncgg[ncgg$neubact==0,-c(44:47,49,50)]
+
+```
+
+Nota: a part de les variables que trec perquè no són interessants, també he tret les de "neumoniaglobal" i "ebocreagu" perquè són tot "1" i per tant no aporten informació.
+
+Propensity score
+===
+
+Comencem calculant la propensity score utilitzant una regressió logística per intentar predir el fet d'estar tractats o no amb les altres variables:
+
+```{r}
+fmla <- as.formula(paste("cortis ~ ", paste(colnames(ncg[,-c(1,2,29,53)]), collapse= "+")))
+
+m.cortis = glm(fmla, data=ncg, family = "binomial")
+summary(m.cortis)
+```
+
+Veiem que el propensity score varia segons la variable, però que és diferent de 0 en algunes d'elles, per tant hem de fer algun tipus de matching per compensar per aquest fet. 
+
+Propensity matching
+===
+
+Fem el matching:
+
+```{r}
+
+#m.nearest = matchit(formula = fmla, data = ncg)
+#m.optimal = matchit(formula = fmla, data = ncg,method = "optimal", ratio = 2)
+m.full = matchit(formula = fmla, data = ncg,method = "full", ratio = 2)
+#prova = matchit(formula = fmla, data = ncg,method = "full", ratio = 2, standarize=TRUE)
+```
+
+Creem la nova base de dades "matchejada":
+
+```{r}
+
+#m.data.nearest=match.data(m.nearest)
+m.data.full = match.data(m.full)
+
+```
+
+I una vegada tenim la base de dades matchejada ja podem dur a terme els càlculs:
+
+Regressió logística cross-validada
+===
+
+Per tal de fer l'anàlisi estadístic dividim les dades en un conjunt on construir el model (80% de les dades) i un altre on provarem el model per saber la seva efectivitat (20% de les dades).
+
+Netegem les dades i creem els dos grups:
+
+```{r}
+df = m.data.full[,-c(2,55,57)]
+#estandaritzem:
+
+
+est = c(3, 5:9, 11:14, 20:22,24, 47, 51)
+for (i in est){
+     df[,i] = (df[,i]-mean(df[,i]))/sd(df[,i])
+   
+}
+
+test = sample(nrow(df),round(nrow(df)/5),replace = FALSE)
+train=(-test)
+```
+
+Ara entrenem el model. Aquest és un model de regressió logística utilitzant la tècnica del ["lasso"](https://en.wikipedia.org/wiki/Lasso_(statistics)) com a mètode de selecció de model (és a dir, el lasso, juntament amb la cross-validació s'encarrega de seleccionar quines variables han d'estar al model i quines no). Utilitzant aquestes tècniques ens assegurem que no tenim ["overfitting"](https://en.wikipedia.org/wiki/Overfitting).
+
+```{r}
+x<- df[,-c(28)]
+y<- df[,28]
+data<-cbind(x,y)
+x_train <- x[train,]
+y_train <- data$y[train]
+x_test <- x[test,]
+y_test <- data$y[test]
+model <- model.matrix(y~.-weights , data=data[train,])
+fit <- cv.glmnet(model,y_train,alpha=1, family="binomial", 
+                 weights = data$weights[train])
+plot(fit)
+```
+
+Anem a veure com són i com prediuen els dos models:
+
+Model
+---
+
+Els predictors són:
+```{r}
+finalc = predict(fit, type='coefficients', s = "lambda.min")[1:68,]
+#finalc
+ffc = finalc[finalc!=0]
+ffc
+```
+
+Veiem que els cortis *no* apareixen entre els predictors diferents de 0 (és a dir, els cortis no aporten poder de predicció al model). 
+
+Mirem com de bé predim la mortalitat en aquest model:
+
+```{r}
+lambda_min<-fit$lambda.min
+newX <- model.matrix(~.-weights,data=x_test, weights = x_test$weights)
+fit_test<-predict(fit,s=lambda_min, newx=newX, type='response')
+fit.pred=rep(0,nrow(x_test))
+fit.pred[fit_test >.5]=1
+ttt=table(fit.pred, y_test)
+rend = (ttt[1]+ttt[4])/sum(ttt)
+rend
+```
+
+El percentatge d'encert del model és: `r rend`
+
+Calculem els OR i els IC:
+
+```{r}
+
+glm.fit = glm(muere ~ .-weights, family = "binomial", data= df[train,], weights = weights)
+reg = 1
+
+```
+
+Els odd rations amb els seus intervals de confiança són i la seva p són:
+
+```{r}
+
+predades = as.data.frame(cbind(exp(coef(glm.fit)), exp(confint(glm.fit)[,1]),exp(confint(glm.fit)[,2]), coef(summary(glm.fit))[,4] ))
+
+ratios = exp(unname(finalc[-c(1,65)]))/exp(coef(glm.fit))
+ratios[length(ratios)]=ratios[length(ratios)]*reg
+
+dades = cbind(ratios*predades[,1:3], predades[,4])
+colnames(dades)=c("OR", "IC-", "IC+", "p")
+nda = dades[round(dades$OR,4)!=1,]
+nda
+```
+
+
+Corbes ROC i AUC
+===
+
+```{r, include=FALSE}
+preroc = cbind(y_test,fit_test)
+preroc=as.data.frame(preroc)
+preroc[,1]=preroc[,1]-1
+preroc[,1]=as.factor(preroc[,1])
+colnames(preroc)=c('survived', 'pred')
+```
+
+```{r, include=FALSE}
+roc4=calculate_roc(preroc, 1, 1, n = 100)
+```
+
+Dibuixem la corba ROC:
+
+```{r, echo=FALSE}
+plot_roc(roc4, 0.4, 1, 1)
+#plot_roc_cost(roc4, 0.5, 1, 1)
+```
+
+L'àrea sota la corba és:
+
+```{r, echo=FALSE}
+cvroc=ci.cvAUC(preroc$pred,preroc$survived)
+cvroc
+```
+
+Fem ara l'anàlisi de supervivència:
+
+Kaplan - Meier
+===
+
+Primer dibuixem la corba Kaplan - Meier:
+
+```{r}
+surv = cbind(cgrip$gapmortalidad, cgrip$muere, cgrip$cortis)
+surv = as.data.frame(surv)
+colnames(surv)=c("Temps", "Mort", "Cortis")
+#surv$Mort=abs(surv$Mort-1)
+
+surv$Temps[surv$Mort==0]<-120
+
+
+sfit <- survfit(Surv(Temps, Mort)~strata(Cortis), data=surv)
+
+ggsurvplot(
+   sfit,                     # survfit object with calculated statistics.
+   data = surv,  # data used to fit survival curves. 
+#   risk.table = TRUE,       # show risk table.
+ #  pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   xlim = c(0,100),        # present narrower X axis, but not affect
+                            # survival estimates.
+  ylim = c(0.6,1),
+   break.time.by = 10,     # break X axis in time intervals by 500.
+
+ ggtheme = theme_minimal() # customize plot and risk table with a theme.
+# risk.table.y.text.col = T, # colour risk table text annotations.
+#  risk.table.y.text = FALSE # show bars instead of names in text annotations
+#                            # in legend of risk table
+  
+) 
+
+```
+
+I calculem el model de Cox:
+
+Model de Cox
+===
+
+```{r}
+ngrip = cgrip[cgrip$neubact==0,]
+errors = which(ngrip$gapmortalidad>0 & ngrip$muere==0)
+ngrip$muere[errors]<-1
+
+ngrip$gapmortalidad[ngrip$muere==0]<-120
+ngrip$X = NULL
+est = c(4,6:9,11:16, 21:24, 26, 31:33, 53,54,58,62)
+
+for (i in est){
+  ngrip[,i] = (ngrip[,i]-mean(ngrip[,i]))/sd(ngrip[,i])
+}
+
+cox_antic <- coxph(Surv(as.numeric(gapmortalidad) ,muere) ~ Edad + apache + diashastauci + infiltrados + LDH + CPK  + insuficrenal + depurrenal + akinclasif + urea + PCT + ventilacion + fracasovni + ic + irenalcron + embarazo + hivsida + neuromusc + autoinmun + inmunodef + nav + cortis , data = ngrip, weights = m.data.full$weights )
+
+summary(cox_antic)
+```
+
+Veiem que en aquest cas els cortis *no* són estadísticament significatius. 
+
+Conclusions
+===
+
+Sense l'efecte de la variable neubact no es pot demostrar que els corticoides tenen un efecte estadísticament significatiu en la mortalitat. Estem molt a prop tot i així (p=0.07) Això no vol dir que no el tinguin, si no que hem perdut la potència estadística ja que, tot i que els pacients amb newbact positiu són pocs, sí que es moren molt més sovint que els altres, ho podem veure aquí:
+
+```{r}
+CrossTable(ncgg$neubact, ncgg$muere)
+```
+
+Aquí podem veure que la mortalitat en els pacients amb neubact positiu és d'un 28%, en canvi dels que el tenen negatiu és un 20%. Això fa que, en treure neubact perdem molts pacients que han mort i que per tant donen potència estadística a l'estudi. Per altra banda, també veiem que la capacitat de predicció ha empitjorat sensiblement amb la retirada dels pacients; hem passat d'una AUC de 0.82 a 0.77. Això ens pot donar una idea de que, per una banda, la variable neubact era important a l'hora de predir mortalitat, i per altra de que és probable que els corticoides també tinguin relació, però amb aquest estudi no es pot demostrar. 
+
+Adjunto més avall alguns gràfics que pretenen visualitzar la relació entre el neubact i la mort, tot i que, a causa de que hi ha moltes variables, no s'aprecia molt clarament.
+
+Representació visual
+===
+
+```{r}
+factorials = c(factorials, 2)
+pca <- prcomp(ncgg[,-factorials], scale. = TRUE)
+
+grups = ifelse(ncgg$neubact==1, ifelse(ncgg$cortis==1, "bact_i_cortis", "bact_sense_cortis"),
+               ifelse(ncgg$cortis==1, "no_bact_i_cortis", "no_bact_sense_cortis"))
+
+ggbiplot(pca, obs.scale = 1, var.scale = 1,
+  groups = grups, ellipse = TRUE, circle = TRUE) +
+  scale_color_discrete(name = '') +
+  theme(legend.direction = 'horizontal', legend.position = 'top')
+```
+
+```{r}
+grups2 = ifelse(ncgg$neubact==1, 
+                ifelse(ncgg$muere==1, "bact_i_mor", "bact_i_viu"),
+               ifelse(ncgg$muere==1, "no_bact_i_mor", "no_bact_i_viu"))
+plsda <- plsda(ncgg[,-c(factorials,ncol(ncgg))], grups2, ncomp = 2, scale = T)
+plotIndiv(plsda, ind.names = TRUE, ellipse = TRUE, legend = TRUE)
+
+```
+
+```{r}
+ncgg$grups = grups
+ncgg$grups = as.factor(ncgg$grups)
+ggplot(ncgg, aes(Edad, apache, colour = grups2)) +
+  geom_point()
+
+dins = which(ncgg$neubact==0)
+ggplot(ncgg[dins,], aes(Edad, apache, colour = grups2[dins])) +
+  geom_point()
+
+```
+

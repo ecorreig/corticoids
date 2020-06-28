@@ -1,0 +1,353 @@
+---
+title: "grip"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+require(MatchIt)
+require(optmatch)
+require(glmnet)
+require(ggplot2)
+require(cvAUC)
+require(survival)
+require(survminer)
+require(reshape2)
+source('corbes_roc.R')
+set.seed(1809)
+```
+
+Importem les dades
+===
+
+```{r}
+grip = read.csv('grip_net.csv')
+```
+
+
+```{r}
+clean=complete.cases(grip)
+cgrip=grip[clean,]
+```
+
+Netegem variables que no necessitem i formatem la resta:
+
+```{r}
+
+cgrip$macrolido[cgrip$macrolido>1]<-1
+
+ncgg = cgrip[,-c(1:4,10:11,17,19,21,22,27:30,32:34,36,49,52:63,65:68)]
+
+
+factorials = c(2,11:12,16:33)
+
+for (i in factorials){
+  ncgg[,i]=as.factor(ncgg[,i])
+}
+
+```
+
+Nota: a part de les variables que trec perquè no són interessants, també he tret les de "neumoniaglobal" i "ebocreagu" perquè són tot "1" i per tant no aporten informació.
+
+
+Propensity matching
+===
+
+Fem el matching, utilitzant el mètode "full". Es pot trobar més informació ["aquí"](https://cran.r-project.org/web/packages/MatchIt/vignettes/matchit.pdf) i ["aquí"](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2943670/).
+
+```{r, warning=FALSE}
+fmla <- as.formula(paste("cortis ~ ", paste(colnames(ncgg[,-c(17,33)]), collapse= "+")))
+#m.nearest = matchit(formula = fmla, data = ncg)
+#m.optimal = matchit(formula = fmla, data = ncg,method = "optimal", ratio = 2)
+m.full = matchit(formula = fmla, data = ncgg,method = "full")
+```
+
+Presento les dades abans i després de passar pel procés de matching:
+
+```{r}
+summary(m.full)
+```
+
+Aquí doncs he afegit les taules per poder presentar les dades abans i després del matching. Aquesta taula ens dóna molta informació, però bàsicament el que necessitem és les dues primeres columnes; la primera mostra el grup de tractament i la segona el grup control. Primer es mostra el "Summary of balance for all data", és a dir els valors abans de fer el matching. Per les variables contínues es mostra la mitja, i per les dicotómiques es mostra el percentatge de cada un. Per exemple, a la variable "Edad" la mitja del grup de tractament és 52.1780 i la del grup control és 51.0113. Pel sexe, veiem que en el grup de tractament de amb un 40.68% de dones (0.4068*100) i un 59.32% d'homes. Més endavant trobem el "Summary of balance for matched data". Aquí tenim la mateixa informació però després de fer el matching. En aquest cas les mitjanes d'edat dels grups de tractament i de control són 52.1780 i 51.8061 respectivament. Veiem que són molt similars a les anteriors perquè ja eren molt similars entre elles i per tant no calia canviar-les. Pel que fa al sexe, seguim tenint valors molt similars als anteriors per la mateixa raó. Si ens fixem, però, per exemple en els Leucos, veiem que abans teníem 10058.1576 i 9255.0539 i ara tenim 10058.1576 i 10008.3259, així que sí que aquí hem fet un matching notable. 
+
+Ara doncs creem la nova base de dades "matchejada":
+
+```{r}
+
+#m.data.nearest=match.data(m.nearest)
+m.data.full = match.data(m.full)
+
+```
+
+I una vegada tenim la base de dades matchejada ja podem dur a terme els càlculs:
+
+Regressió logística cross-validada
+===
+
+Per tal de fer l'anàlisi estadístic dividim les dades en un conjunt on construir el model (80% de les dades) i un altre on provarem el model per saber la seva efectivitat (20% de les dades).
+
+Netegem les dades i creem els dos grups:
+
+```{r}
+df = m.data.full[,-c(34,36)]
+test = sample(nrow(df),round(nrow(df)/5),replace = FALSE)
+train=(-test)
+```
+
+Ara entrenem el model. Aquest és un model de regressió logística utilitzant la tècnica del ["lasso"](https://en.wikipedia.org/wiki/Lasso_(statistics)) com a mètode de selecció de model (és a dir, el lasso, juntament amb la cross-validació s'encarrega de seleccionar quines variables han d'estar al model i quines no). Utilitzant aquestes tècniques ens assegurem que no tenim ["overfitting"](https://en.wikipedia.org/wiki/Overfitting).
+
+```{r}
+x<- df[,-c(17)]
+y<- df[,17]
+data<-cbind(x,y)
+x_train <- x[train,]
+y_train <- data$y[train]
+x_test <- x[test,]
+y_test <- data$y[test]
+model <- model.matrix(y~.-weights , data=data[train,])
+fit <- cv.glmnet(model,y_train,alpha=1, family="binomial", weights = data$weights[train])
+#plot(fit)
+```
+
+Les variables predictores d'aquest model són:
+
+```{r}
+finalc = predict(fit, type='coefficients', s = "lambda.min")[1:34,]
+#finalc
+ffc = finalc[finalc!=0]
+coefs = cbind(names(ffc), round(unname(ffc), 4), round(exp(unname(ffc)),4))
+coefs = as.data.frame(coefs)
+colnames(coefs)=c("Variable", "Coeficient", "OR")
+
+```
+
+Mirem com de bé predim la mortalitat en aquest model:
+
+```{r}
+lambda_min<-fit$lambda.min
+newX <- model.matrix(~.-weights,data=x_test, weights = x_test$weights)
+fit_test<-predict(fit,s=lambda_min, newx=newX, type='response')
+fit.pred=rep(0,nrow(x_test))
+fit.pred[fit_test >.5]=1
+ttt=table(fit.pred, y_test)
+rend = (ttt[1]+ttt[4])/sum(ttt)
+```
+
+
+```{r}
+
+glm.fit = glm(muere~apache + sofa + diashastauci + infiltrados + LDH + Leucos + depurrenal + pcr + ventilacion + shock + ic + hivsida + autoinmun + inmunodef + neuprim + cortis, family = "binomial", data= m.data.full[train,], weights = weights)
+reg = 1.02
+
+```
+
+Els odd rations amb els seus intervals de confiança són i la seva p són:
+
+```{r}
+
+predades = as.data.frame(cbind(exp(coef(glm.fit)), exp(confint(glm.fit)[,1]),exp(confint(glm.fit)[,2]), coef(summary(glm.fit))[,4] ))
+
+
+
+ratios = exp(unname(ffc)[-17])/exp(coef(glm.fit))
+ratios[length(ratios)]=ratios[length(ratios)]*reg
+
+dades = cbind(ratios*predades[,1:3], predades[,4])
+colnames(dades)=c("OR", "IC-", "IC+", "p")
+dades
+
+```
+
+
+
+El percentatge d'encert del model és: `r rend`, per tant un valor molt bo. 
+
+Corbes ROC i AUC
+===
+
+```{r, include=FALSE}
+preroc = cbind(y_test,fit_test)
+preroc=as.data.frame(preroc)
+preroc[,1]=preroc[,1]-1
+preroc[,1]=as.factor(preroc[,1])
+colnames(preroc)=c('survived', 'pred')
+```
+
+```{r, include=FALSE}
+roc4=calculate_roc(preroc, 1, 1, n = 100)
+```
+
+Dibuixem la corba ROC:
+
+```{r, echo=FALSE}
+plot_roc(roc4, 0.5, 1, 1)
+```
+
+L'àrea sota la corba és:
+
+```{r, echo=FALSE}
+cvroc=ci.cvAUC(preroc$pred,preroc$survived)
+cvroc
+```
+
+
+Fem ara l'anàlisi de supervivència:
+
+Kaplan - Meier
+===
+
+Primer dibuixem la corba Kaplan - Meier:
+
+```{r}
+surv = cbind(cgrip$gapmortalidad, cgrip$muere, cgrip$cortis)
+surv = as.data.frame(surv)
+colnames(surv)=c("Temps", "Mort", "Cortis")
+#surv$Mort=abs(surv$Mort-1)
+
+surv$Temps[surv$Mort==0]<-200
+
+
+sfit <- survfit(Surv(Temps, Mort)~strata(Cortis), data=surv)
+
+ggsurvplot(
+   sfit,                     # survfit object with calculated statistics.
+   data = surv,  # data used to fit survival curves. 
+   risk.table = TRUE,       # show risk table.
+ #  pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   xlim = c(0,100),        # present narrower X axis, but not affect
+                            # survival estimates.
+  ylim = c(0.6,1),
+   break.time.by = 10,     # break X axis in time intervals by 500.
+
+ ggtheme = theme_minimal(), # customize plot and risk table with a theme.
+ risk.table.y.text.col = T, # colour risk table text annotations.
+  risk.table.y.text = FALSE # show bars instead of names in text annotations
+#                            # in legend of risk table
+  
+) 
+
+```
+
+Model de Cox
+===
+
+```{r, include=FALSE}
+
+cgrip$macrolido[cgrip$macrolido>1]<-1
+
+ncgg = cgrip[,-c(1,11,32:34,65,67,68)]
+
+
+factorials = c(1,3,5,11,16:20,24,26:50,52:53,55:57,59:60)
+
+for (i in factorials){
+  ncgg[,i]=as.factor(ncgg[,i])
+}
+ncg=ncgg[,-c(44,47,49,50)]
+
+
+m.full = matchit(formula = fmla, data = ncg,method = "full", ratio = 2)
+m.data.full = match.data(m.full)
+```
+
+```{r}
+errors = which(cgrip$gapmortalidad>0 & cgrip$muere==0)
+cgrip$muere[errors]<-1
+
+cgrip$gapmortalidad[cgrip$muere==0]<-120
+
+cox_antic <- coxph(Surv(as.numeric(gapmortalidad) ,muere) ~ Edad + apache + diashastauci + infiltrados + LDH + CPK  + insuficrenal + depurrenal + akinclasif + urea + PCT + ventilacion + fracasovni + ic + irenalcron + embarazo + hivsida + neuromusc + autoinmun + inmunodef + nav + cortis , data = cgrip, weights = m.data.full$weights )
+
+summary(cox_antic)
+```
+
+La OR del cortis és doncs 1.440 amb intervals de confiança 1.1820 i 1.7639.
+
+Representació gràfica del model de Cox
+---
+
+```{r}
+
+attach(cgrip)
+mitja <- function(variable){
+  p = by(variable, muere, summary)
+  
+  qq=c(unname(p$'0'[4]),unname(p$'1'[4]))
+  return (qq)
+  }
+
+valor =0.18
+suma <- function(variable){
+ # q = by(variable, muere, sum)
+#  q=q/sum(q)
+  q=list((valor),(valor))
+  return(q)
+}
+```
+
+```{r}
+newdata <- with(cgrip,
+               data.frame(cortis = c(0, 1), 
+                          Edad = c(mitja(Edad)[1],mitja(Edad)[2]),
+                          apache = c(mitja(apache)[1],mitja(apache)[2]),
+                          diashastauci = c(mitja(diashastauci)[1],
+                                           mitja(diashastauci)[2]),
+                          infiltrados = c(mitja(infiltrados)[1],
+                                          mitja(infiltrados)[2]),
+                          LDH = c(mitja(LDH)[1],mitja(LDH)[2]),
+                          CPK = c(mitja(CPK)[1],mitja(CPK)[2]),
+                          insuficrenal =c(suma(insuficrenal)[[1]],
+                                          suma(insuficrenal)[[2]]),
+                          depurrenal =c(suma(depurrenal)[[1]],
+                                          suma(depurrenal)[[2]]),
+                          urea =c(mitja(urea)[1],mitja(urea)[2]),
+                           akinclasif =c(mitja(akinclasif)[1],mitja(akinclasif)[2]),
+                          PCT =c(mitja(PCT)[1],mitja(PCT)[2]),
+                          ventilacion =c(suma(ventilacion)[[1]],
+                                          suma(ventilacion)[[2]]),
+                          fracasovni =c(suma(fracasovni)[[1]],
+                                          suma(fracasovni)[[2]]),
+                          ic =c(suma(ic)[[1]], suma(ic)[[2]]),
+                          irenalcron = c(suma(irenalcron)[[1]],
+                                         suma(irenalcron)[[2]]),
+                          embarazo =c(suma(embarazo)[[1]],
+                                         suma(embarazo)[[2]]),
+                          hivsida =c(suma(hivsida)[[1]],
+                                         suma(hivsida)[[2]]),
+                          neuromusc =c(suma(neuromusc)[[1]],
+                                         suma(neuromusc)[[2]]),
+                          autoinmun =c(suma(autoinmun)[[1]],
+                                         suma(autoinmun)[[2]]),
+                          inmunodef =c(suma(inmunodef)[[1]],
+                                         suma(inmunodef)[[2]]),
+                          nav =c(suma(nav)[[1]],
+                                         suma(nav)[[2]])
+            )
+            )
+```
+
+
+```{r}
+# fit <- survfit(cox_antic, newdata = newdata)
+# 
+# plot = ggsurvplot(fit, 
+#            conf.int = TRUE, 
+#            censor = TRUE, 
+#          #  surv.median.line = "hv",
+#            legend.labs=c("Cortis"), 
+#            xlim=c(0,110), 
+#            ylim=c(0.6,1),
+#           # axis.text.y = element_blank(),
+#          ggtheme = theme_minimal(),
+#            break.time.by = 10
+#         )
+# 
+# plot
+```
+
+Conclusions
+===
+
+Veiem doncs que tant el model de regressió logística com el de regressió de Cox són molt sòlids i mostren que els cortis són un element molt important en la predicció de mort en pacients de grip. 

@@ -1,0 +1,40 @@
+---
+title: "grip-altres"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Logistic regression on matched data
+===
+
+```{r}
+
+# m.data <- match.data(m.optimal)
+# m.data=match.data(m.nearest)
+
+f.mort = as.formula(paste("muere ~ ", paste(colnames(m.data.full[, -c(2,29,57:59)]), collapse= "+")))
+
+model.mort = glm(f.mort, data=m.data.full, family = "binomial", weights = m.data.full$weights )
+summary(model.mort)
+
+slm.probs=predict(model.mort, type = 'response')
+slm.pred=rep(0,nrow(m.data.full))
+slm.pred[slm.probs >.5]=1
+tt = table(slm.pred, m.data.full$muere)
+(tt[1]+tt[4])/sum(tt)
+
+```
+
+```{r}
+f.cortis = as.formula(paste("cortis ~ ", paste(colnames(m.data.nearest[ ,-c(2,29,55,57:59)]), collapse= "+")))
+
+model.cortis.n = glm(f.cortis, data=m.data.nearest, family = "binomial")
+summary(model.cortis.n)
+
+model.cortis.f = glm(f.cortis, data=m.data.full, family = "binomial", weights = m.data.full$weights )
+summary(model.cortis.f)
+
+```

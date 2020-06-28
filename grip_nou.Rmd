@@ -1,0 +1,706 @@
+---
+title: "grip"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+library(MatchIt)
+library(optmatch)
+library(glmnet)
+library(ggplot2)
+library(cvAUC)
+library(survival)
+library(survminer)
+library(reshape2)
+source('corbes_roc.R')
+library(cobalt)
+library(cmprsk)
+library(forestmodel)
+#require(cowplot)
+#require(ggsci)
+source('crisks.R')
+set.seed(1809)
+```
+
+Import clean data
+===
+
+```{r}
+grip = read.csv('grip_net.csv', fileEncoding = "UTF-8")
+```
+
+
+```{r}
+grip$novsneumo[is.na(grip$novsneumo)]=0
+clean=complete.cases(grip)
+cgrip=grip[clean,]
+```
+
+Netegem variables que no necessitem i formatem la resta:
+
+```{r}
+
+cgrip$macrolido[cgrip$macrolido>1]<-1
+
+ncgg = cgrip[,-c(1,11,32:34,65,67,68)]
+
+
+factorials = c(1,3,5,11,16:20,24,26:50,52:53,55:57,59:60)
+
+for (i in factorials){
+  ncgg[,i]=as.factor(ncgg[,i])
+}
+ncg=ncgg[,-c(44,47,49,50)]
+
+ngrip = cgrip
+```
+
+Nota: a part de les variables que trec perquè no són interessants, també he tret les de "neumoniaglobal" i "ebocreagu" perquè són tot "1" i per tant no aporten informació.
+
+Propensity score
+===
+
+Comencem calculant la propensity score utilitzant una regressió logística per intentar predir el fet d'estar tractats o no amb les altres variables:
+
+```{r}
+fmla <- as.formula(paste("cortis ~ ", 
+                         paste(colnames(ncg[,-c(1,2,29,55)]), collapse= "+")))
+# 
+m.cortis = glm(fmla, data=ncg, family = "binomial")
+summary(m.cortis)
+```
+
+Veiem que el propensity score varia segons la variable, però que és diferent de 0 en algunes d'elles, per tant hem de fer algun tipus de matching per compensar per aquest fet. 
+
+Propensity matching
+===
+
+Fem el matching, utilitzant el mètode "full". Es pot trobar més informació ["aquí"](https://cran.r-project.org/web/packages/MatchIt/vignettes/matchit.pdf) i ["aquí"](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2943670/).
+
+```{r}
+m.full = matchit(formula = fmla, data = ncg,method = "full", ratio = 2)
+```
+
+Creem la nova base de dades "matchejada":
+
+```{r}
+m.data.full = match.data(m.full)
+```
+
+I una vegada tenim la base de dades matchejada ja podem dur a terme els càlculs:
+
+Regressió logística cross-validada
+===
+
+Per tal de fer l'anàlisi estadístic dividim les dades en un conjunt on construir el model (80% de les dades) i un altre on provarem el model per saber la seva efectivitat (20% de les dades).
+
+Netegem les dades i creem els dos grups:
+
+```{r}
+df = m.data.full[,-c(2,57,59)]
+test = sample(nrow(df),round(nrow(df)/5),replace = FALSE)
+train=(-test)
+```
+
+Ara entrenem el model. Aquest és un model de regressió logística utilitzant la tècnica del ["lasso"](https://en.wikipedia.org/wiki/Lasso_(statistics)) com a mètode de selecció de model (és a dir, el lasso, juntament amb la cross-validació s'encarrega de seleccionar quines variables han d'estar al model i quines no). Utilitzant aquestes tècniques ens assegurem que no tenim ["overfitting"](https://en.wikipedia.org/wiki/Overfitting).
+
+```{r}
+x<- df[,-c(28)]
+y<- df[,28]
+data<-cbind(x,y)
+x_train <- x[train,]
+y_train <- data$y[train]
+x_test <- x[test,]
+y_test <- data$y[test]
+model <- model.matrix(y~.-weights , data=data[train,])
+fit <- cv.glmnet(model,y_train,alpha=1, family="binomial", weights = data$weights[train])
+```
+
+Anem a veure com són i com prediuen els dos models:
+
+Model complert, amb 34 variables:
+---
+
+Els predictors són:
+
+```{r}
+finalc = predict(fit, type='coefficients', s = "lambda.min")[1:70,]
+#finalc
+ffc = finalc[finalc!=0]
+ffc
+```
+
+Veiem que els cortis estan en els predictors.
+
+Mirem com de bé predim la mortalitat en aquest model:
+
+```{r}
+lambda_min<-fit$lambda.min
+newX <- model.matrix(~.-weights,data=x_test, weights = x_test$weights)
+fit_test<-predict(fit,s=lambda_min, newx=newX, type='response')
+fit.pred=rep(0,nrow(x_test))
+fit.pred[fit_test >.5]=1
+ttt=table(fit.pred, y_test)
+rend = (ttt[1]+ttt[4])/sum(ttt)
+ttt
+```
+
+El percentatge d'encert del model és: `r rend`
+
+
+Corbes ROC i AUC
+===
+
+```{r, include=FALSE}
+preroc = cbind(y_test,fit_test)
+preroc=as.data.frame(preroc)
+preroc[,1]=preroc[,1]-1
+preroc[,1]=as.factor(preroc[,1])
+colnames(preroc)=c('survived', 'pred')
+```
+
+```{r, include=FALSE}
+roc4=calculate_roc(preroc, 1, 1, n = 100)
+```
+
+Dibuixem la corba ROC:
+
+```{r, echo=FALSE}
+plot_roc(roc4, 0.5, 1, 1)
+```
+
+L'àrea sota la corba és:
+
+```{r, echo=FALSE}
+cvroc=ci.cvAUC(preroc$pred,preroc$survived)
+cvroc
+```
+
+Fem ara l'anàlisi de supervivència:
+
+Kaplan - Meier
+===
+
+Primer dibuixem la corba Kaplan - Meier (només per visualitzar, no ha d'entrar als models finals).
+
+```{r}
+surv = cbind(cgrip$gapmortalidad,
+             cgrip$muere,
+             cgrip$cortis)
+surv = as.data.frame(surv)
+colnames(surv)=c("Temps", "Mort", "Cortis")
+#surv$Mort=abs(surv$Mort-1)
+
+surv$Temps[surv$Mort==0]<-100
+
+
+sfit <- survfit(Surv(Temps, Mort)~strata(Cortis), data=surv)
+
+ggsurvplot(
+   sfit,                     # survfit object with calculated statistics.
+   data = surv,  # data used to fit survival curves. 
+   risk.table = TRUE,       # show risk table.
+   legend.labs=c("No cortis", "Cortis"),
+ #  pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   xlim = c(0,90),        # present narrower X axis, but not affect
+                            # survival estimates.
+  ylim = c(0.5,1),
+   break.time.by = 10,     # break X axis in time intervals by 500.
+
+ ggtheme = theme_minimal(), # customize plot and risk table with a theme.
+ risk.table.y.text.col = T, # colour risk table text annotations.
+  risk.table.y.text = FALSE # show bars instead of names in text annotations
+#                            # in legend of risk table
+  
+) 
+
+```
+
+I calculem el model de Cox (o cause specific hazard ratio)
+
+Models de Cox (CSH)
+===
+```{r}
+errors = which(cgrip$gapmortalidad>0 & cgrip$muere==0)
+cgrip$muere[errors]<-1
+
+cgrip$gapmortalidad[cgrip$muere==0]<-100 # simulem que tots estan censurats a 100 dies ja que només ho estem simulant a 90
+
+cox <- coxph(Surv(as.numeric(gapmortalidad) ,muere) ~ Edad + apache + diashastauci + infiltrados + LDH + CPK  + insuficrenal + depurrenal + akinclasif + urea + PCT + ventilacion + fracasovni + ic + irenalcron + embarazo + hivsida + neuromusc + autoinmun + inmunodef + nav + strata(cortis) , data = cgrip, weights = m.data.full$weights )
+
+summary(cox)
+```
+
+```{r}
+# ara fem el dibuix del model de cox seguint aquest mètode: 
+# https://github.com/kassambara/survminer/issues/67
+# NOTE: this is not entirely correct. See https://github.com/ecorreig/STACOV for a 
+# correct method
+
+# ajudes per crear les noves dades
+attach(cgrip)
+mitja <- function(variable){
+  p = by(variable, cortis, summary)
+  
+  qq=c(unname(p$'0'[4]),unname(p$'1'[4]))
+  return (qq)
+  }
+
+suma <- function(variable){
+  q = by(cortis, variable, sum)
+  q[1] = q[1]/sum(variable==0)
+  q[2] = q[2]/sum(variable==1)
+  qq=list(q[1],q[2])
+#  qq = list(1, 1)
+  return(qq)
+}
+
+#creem les dades de dues persones amb la mitjana de cada una de les variables
+newdata <- with(cgrip,
+               data.frame(cortis = c(0, 1), 
+                          Edad = c(mitja(Edad)[1],mitja(Edad)[2]),
+                          apache = c(mitja(apache)[1],mitja(apache)[2]),
+                          diashastauci = c(mitja(diashastauci)[1],
+                                           mitja(diashastauci)[2]),
+                          infiltrados = c(mitja(infiltrados)[1],
+                                          mitja(infiltrados)[2]),
+                          LDH = c(mitja(LDH)[1],mitja(LDH)[2]),
+                          CPK = c(mitja(CPK)[1],mitja(CPK)[2]),
+                          insuficrenal =c(suma(insuficrenal)[[1]],
+                                          suma(insuficrenal)[[2]]),
+                          depurrenal =c(suma(depurrenal)[[1]],
+                                          suma(depurrenal)[[2]]),
+                          akinclasif =c(mitja(akinclasif)[1],mitja(akinclasif)[2]),
+                          urea =c(mitja(urea)[1],mitja(urea)[2]),
+                           
+                          PCT =c(mitja(PCT)[1],mitja(PCT)[2]),
+                          ventilacion =c(suma(ventilacion)[[1]],
+                                          suma(ventilacion)[[2]]),
+                          fracasovni =c(suma(fracasovni)[[1]],
+                                          suma(fracasovni)[[2]]),
+                          ic =c(suma(ic)[[1]], suma(ic)[[2]]),
+                          irenalcron = c(suma(irenalcron)[[1]],
+                                         suma(irenalcron)[[2]]),
+                          embarazo =c(suma(embarazo)[[1]],
+                                         suma(embarazo)[[2]]),
+                          hivsida =c(suma(hivsida)[[1]],
+                                         suma(hivsida)[[2]]),
+                          neuromusc =c(suma(neuromusc)[[1]],
+                                         suma(neuromusc)[[2]]),
+                          autoinmun =c(suma(autoinmun)[[1]],
+                                         suma(autoinmun)[[2]]),
+                          inmunodef =c(suma(inmunodef)[[1]],
+                                         suma(inmunodef)[[2]]),
+                          nav =c(suma(nav)[[1]],
+                                         suma(nav)[[2]])
+            )
+            )
+```
+
+```{r}
+
+# recalculem el model
+fit <- survfit(cox, newdata = newdata)
+
+# dibuixem
+plot = ggsurvplot(fit,
+                  data = newdata,
+                  conf.int = TRUE,
+                  legend.labs=c("No cortis", "Cortis"),
+                  xlim=c(0,90),
+                  ylim=c(0.5,1),
+                  ggtheme = theme_minimal(),
+                  break.time.by = 10,
+                  risk.table = TRUE,       # show risk table.
+                  risk.table.y.text.col = T, # colour risk table text annotations.
+                  risk.table.y.text = F # show bars instead of names in text annotations
+                  ) 
+
+plot 
+
+```
+
+Corbes fetes amb un altre mètode similar (però no exactament igual; en aquest no cas no es fa la corba predictiva d'un pacient amb els valors mitjand de les covariables, si no que es calculen totes les corbes predictives i se'n fa la mitjana; els resultats són similars.)
+
+```{r}
+# corbes fetes amb un altre mètode
+# Note: same as before, not fully correct
+ggadjustedcurves(cox,
+                 data = cgrip,
+                 individual.curves = T,
+                 variable = "cortis",
+                 method = "average",
+                 conf.int = TRUE,
+                 conf.int.style = "step",
+                 conf.int.alpha = 0.2,
+                 legend.labs=c("No cortis", "Cortis"),
+                 xlim=c(0,90),
+                 ylim=c(0.6,1),
+                 ggtheme = theme_bw(),
+                 break.time.by = 10,
+                 risk.table = TRUE,       # show risk table.
+                 risk.table.y.text.col = T, # colour risk table text annotations.
+                 risk.table.y.text = F # show bars instead of names in text annotations
+                )
+
+```
+
+Altres
+===
+
+Forest plot:
+
+```{r}
+forest_model(cox)
+```
+
+Més KM: 
+
+```{r}
+sfit <- survfit(Surv(Temps, Mort)~strata(Cortis), data=surv)
+
+ggsurvplot(
+   sfit,                     # survfit object with calculated statistics.
+   data = surv,  # data used to fit survival curves. 
+   risk.table = TRUE,       # show risk table.
+   legend.labs=c("No cortis", "Cortis"),
+ #  pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   xlim = c(0,90),        # present narrower X axis, but not affect
+                            # survival estimates.
+  ylim = c(0.6,1),
+   break.time.by = 10,     # break X axis in time intervals by 500.
+
+ ggtheme = theme_minimal(), # customize plot and risk table with a theme.
+ risk.table.y.text.col = T, # colour risk table text annotations.
+  risk.table.y.text = FALSE # show bars instead of names in text annotations
+#                            # in legend of risk table
+  
+) 
+
+
+```
+
+Conclusions
+===
+
+Vist tot això, els reusltats són una mica inconcluents. És a dir, veiem que els corticoides tenen efectes en la mortalitat, i sobre tot o podem veure en els models de Cox. El que passa és que en la regressió logística ja costa més de veure-ho. Els Cortis estan just al límit de les variables que són significativament rellevants. 
+
+El que passa aquí jo crec és que el model és una mica confòs perquè hi ha massa variables. És a dir, hauríem d'intentar treure alguns dels factors. Per exemple (per dir alguna cosa), els dies a l'hospital són rellevants per saber si els cortis tenen efecte? Els dies fins a la UCI? O sigui, pot ser que surtin significatius, però a nivell mèdic no té molt de sentit, no, posar els dies a l'hospital? Sabem que els dies a l'hospital van en funció de les altres variables, per tant no sé si a nivell mèdic s'hauria de posar en el model. 
+
+En fi, per continuar i refinar el model m'agradaria que féssim una segona revisió de les variables i simplifiquéssim el model amb arguments mèdics i lògics. 
+
+Competing risks analysis
+===
+
+Dia 90 (recomanat)
+===
+
+```{r}
+ngrip$X = NULL
+ngrip$crvar = as.factor(ifelse(ngrip$muere==1, "mort", ifelse(ngrip$estancia<91, "alta", "censura")))
+# aquí sobre hem pres els pacients que encara són a la UCI a partir del dia 90 com els que censurem (és a dir, que no han tingut cap esdeveniment). Això no té sentit però és per poder fer l'anàlisi de competing risks. 
+
+
+fact = c(3,5,17:21,25,27:30, 34:52, 55:57, 59:61,63:67)
+for (i in fact){
+  ngrip[,i] = as.factor(as.character(ngrip[,i]))
+}
+
+```
+
+Finegray analysis (competitive risk)
+
+Mortalitat:
+
+```{r}
+
+
+fg = finegray(Surv(estancia, crvar) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+ Leucos+creatinina+insuficrenal+
+                Dialisis+depurrenal+hfvvc+urea+PCT+pcr+ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+              ngrip, etype = "mort")
+
+cox_fg = coxph(Surv(fgstart, fgstop, fgstatus) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+
+                 Leucos+creatinina+insuficrenal+Dialisis+depurrenal+hfvvc+urea+PCT+pcr +
+                 ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+               fg, m.data.full$weights )
+
+summary(cox_fg)
+```
+
+Alta:
+
+```{r}
+
+ngrip$crvar2 = relevel(as.factor(ngrip$crvar), "mort")
+fg = finegray(Surv(estancia, crvar2) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+ Leucos+creatinina+insuficrenal+
+                Dialisis+depurrenal+hfvvc+urea+PCT+pcr+ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+              ngrip, etype = "alta")
+
+cox_fg = coxph(Surv(fgstart, fgstop, fgstatus) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+
+                 Leucos+creatinina+insuficrenal+Dialisis+depurrenal+hfvvc+urea+PCT+pcr +
+                 ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+               fg, m.data.full$weights )
+
+summary(cox_fg)
+```
+
+
+Dibuixem les corbes:
+
+```{r}
+ngrip$crvar = as.factor(ifelse(muere==1, 1, ifelse(estancia<91, 2, 0)))
+fstatus = factor(ngrip$crvar, 0:2, c("Censored", "Death", "Discharge"))
+group = factor(ngrip$cortis, 0:1, c("No_Corticosteroid", "Corticosteroid"))
+crfit = cuminc(ftime = ngrip$estancia, fstatus = fstatus, group = group)
+
+ggcompetingrisks(crfit,multiple_panels = F, conf.int = F) +
+  xlim(0, 90)
+#  theme_cowplot() + 
+#  scale_fill_jco()
+```
+
+Més gràfics:
+
+```{r}
+ggcompetingrisks(crfit,multiple_panels = T, conf.int = T) +
+  xlim(0, 90)
+```
+
+
+Dia 60:
+===
+
+```{r}
+ngrip$crvar = as.factor(ifelse(ngrip$muere==1, "mort", 
+                               ifelse(ngrip$estancia<61, "alta", "censura")))
+```
+
+Finegray analysis (competitive risk)
+
+Mortalitat:
+
+```{r}
+
+
+fg = finegray(Surv(estancia, crvar) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+ Leucos+creatinina+insuficrenal+
+                Dialisis+depurrenal+hfvvc+urea+PCT+pcr+ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+              ngrip, etype = "mort")
+
+cox_fg = coxph(Surv(fgstart, fgstop, fgstatus) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+
+                 Leucos+creatinina+insuficrenal+Dialisis+depurrenal+hfvvc+urea+PCT+pcr +
+                 ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+               fg, m.data.full$weights )
+
+summary(cox_fg)
+```
+
+Alta:
+
+```{r}
+
+ngrip$crvar2 = relevel(as.factor(ngrip$crvar), "mort")
+fg = finegray(Surv(estancia, crvar2) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+ Leucos+creatinina+insuficrenal+
+                Dialisis+depurrenal+hfvvc+urea+PCT+pcr+ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+              ngrip, etype = "alta")
+
+cox_fg = coxph(Surv(fgstart, fgstop, fgstatus) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+
+                 Leucos+creatinina+insuficrenal+Dialisis+depurrenal+hfvvc+urea+PCT+pcr +
+                 ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+               fg, m.data.full$weights )
+
+summary(cox_fg)
+```
+
+Dibuixem les corbes:
+
+```{r}
+ngrip$crvar = as.factor(ifelse(ngrip$muere==1, 1, ifelse(ngrip$estancia<61, 2, 0)))
+fstatus = factor(ngrip$crvar, 0:2, c("Censored", "Death", "Discharge"))
+group = factor(ngrip$cortis, 0:1, c("No_Corticosteroid", "Corticosteroid"))
+crfit = cuminc(ftime = ngrip$estancia, fstatus = fstatus, group = group)
+
+ggcompetingrisks(crfit,multiple_panels = F, conf.int = F) +
+  xlim(0,60)
+#  theme_cowplot() + 
+#  scale_fill_jco()
+```
+
+Més gràfics:
+
+```{r}
+ggcompetingrisks(crfit,multiple_panels = T, conf.int = T) +
+  xlim(0,60)
+```
+
+Dia 30:
+===
+
+```{r}
+
+ngrip$crvar = as.factor(ifelse(ngrip$muere==1, "mort", 
+                               ifelse(ngrip$estancia<31, "alta", "censura")))
+```
+
+Finegray analysis (competitive risk)
+
+Mortalitat:
+
+```{r}
+fg = finegray(Surv(estancia, crvar) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+ Leucos+creatinina+insuficrenal+
+                Dialisis+depurrenal+hfvvc+urea+PCT+pcr+ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+              ngrip, etype = "mort")
+
+cox_fg = coxph(Surv(fgstart, fgstop, fgstatus) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+
+                 Leucos+creatinina+insuficrenal+Dialisis+depurrenal+hfvvc+urea+PCT+pcr +
+                 ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+               fg, m.data.full$weights )
+
+summary(cox_fg)
+```
+
+Alta:
+
+```{r}
+ngrip$crvar2 = relevel(as.factor(ngrip$crvar), "mort")
+
+fg = finegray(Surv(estancia, crvar2) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+ Leucos+creatinina+insuficrenal+
+                Dialisis+depurrenal+hfvvc+urea+PCT+pcr+ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+              ngrip, etype = "alta")
+
+cox_fg = coxph(Surv(fgstart, fgstop, fgstatus) ~ Edad+Sexo+apache+sofa+infiltrados+LDH+
+                 Leucos+creatinina+insuficrenal+Dialisis+depurrenal+hfvvc+urea+PCT+pcr +
+                 ventilacion+diasvm+fracasovni+VNI+VMI+shock+comorbilid+
+                asma+COPD+irenalcron+dbt+hivsida+neuromusc+autoinmun+inmunodef + cortis, 
+               fg, m.data.full$weights )
+
+summary(cox_fg)
+```
+
+Dibuixem les corbes:
+
+```{r}
+ngrip$crvar = as.factor(ifelse(muere==1, 1, ifelse(estancia<31, 2, 0)))
+fstatus = factor(ngrip$crvar, 0:2, c("Censored", "Death", "Discharge"))
+group = factor(ngrip$cortis, 0:1, c("No_Corticosteroid", "Corticosteroid"))
+crfit = cuminc(ftime = ngrip$estancia, fstatus = fstatus, group = group)
+
+ggcompetingrisks(crfit,multiple_panels = F, conf.int = F) +
+  xlim(0, 30)
+#  theme_cowplot() + 
+#  scale_fill_jco()
+```
+
+Més gràfics:
+
+```{r}
+ggcompetingrisks(crfit,multiple_panels = T, conf.int = T) +
+  xlim(0,30)
+```
+
+Gràfic del propensity score
+===
+
+Recordem que el propensity score és la probabilitat que un pacient sigui assignat a un tractament en particular (per exemple, l'administració de corticoides) basat en les seves covariables (en un experiment perfecte el PS seria 0.5 per tots els pacients). Dibuixem la distribució de propensity score per als pacients de l'estudi:
+
+```{r}
+ggplot(m.data.full, aes(distance)) + 
+  geom_histogram(fill = "blue", alpha = 0.7, bins = 30) + 
+  geom_vline(xintercept = 0.5, colour = "red") + 
+  ylab("Number of patients") + 
+  xlab("Propensity score") +
+  ggtitle("Propensity score histogram") + 
+  theme_bw()
+
+ggplot(m.data.full, aes(distance)) + 
+  geom_density(fill = "blue", alpha = 0.3) + 
+  geom_vline(xintercept = 0.5, colour = "red") + 
+  ylab("Number of patients") + 
+  xlab("Propensity score") +
+  ggtitle("Propensity score density plot") +
+  theme_bw()
+
+```
+
+Més altres
+===
+
+
+```{r}
+plot.summary.matchit <- function(x, interactive = TRUE, ...) {
+  if ("matchit.exact" %in% class(x)){
+    stop("Not appropriate for exact matching.  No plots generated.")
+  }
+
+	sd.pre <- abs(x$sum.all$"Mean Diff")
+	sd.post <- abs(x$sum.matched$"Mean Diff")
+
+	if (!is.null(x$q.table)) sd.post <- abs(x$sum.subclass$"Mean Diff") 
+
+	ases.dat <- data.frame(es.unw = sd.pre, es.w = sd.post)
+	par(mfrow=c(1,1))
+        plot(c(0.85, 2.15), c(0, min(3, max(unlist(ases.dat[, 
+            1:2]), na.rm = TRUE))), type = "n", xaxt = "n", ylab = "Absolute Standardized Diff in Means", 
+            xlab = "", main = "")
+        abline(h = c(0.2, 0.4, 0.6, 0.8, 1.0))
+        axis(side = 1, at = 1:2, labels = c("All Data", "Matched Data"))
+        for (i in 1:nrow(ases.dat)) {
+            points(1:2, abs(ases.dat[i, c("es.unw", "es.w")]), 
+                type = "b", col = "grey", pch=19)
+        }
+        temp1 <- ases.dat[abs(ases.dat$es.unw) < abs(ases.dat$es.w),]
+        for (i in 1:nrow(temp1)) {
+            points(1:2, abs(temp1[i, c("es.unw", "es.w")]), type = "b", 
+                col = "black", lwd = 2, pch=19)
+        }
+        if (max(ases.dat$es.w, na.rm = TRUE) > 3) 
+            mtext(text = "Some standardized diffs in means > 3 after matching!", side = 3, 
+                col = "red")
+
+  if(interactive==TRUE) {
+        print("To identify the variables, use first mouse button; to stop, use second.")
+        identify(rep(1, length(sd.pre)),sd.pre,rownames(x$sum.all),atpen=T)
+	identify(rep(2, length(sd.post)),sd.post,rownames(x$sum.all),atpen=T)
+  }
+}
+
+```
+
+
+```{r Fig1, fig.height=8, warning=FALSE}
+# plot per veure la distància entre mitjanes
+est = c(4,6,8:10,12:15,21:23,25,50,54)
+scg = ncg
+for (i in est){
+  scg[,i] = (ncg[,i] - mean(ncg[,i]))/sd(ncg[,i])
+}
+scg$sofa <-NULL
+
+fmla_mes <- as.formula(paste("cortis ~ ", paste(colnames(scg[ ,-c(1,2,10,19,50,3,30,47,52,28,54)]), collapse= "+")))
+
+ms = matchit(formula = fmla_mes, data = scg,method = "full", ratio = 2)
+sms = summary(ms)
+plot.summary.matchit(sms)
+```
+
+```{r Fig2, fig.height=8, warning=FALSE}
+# plot per veure una altra vegada la difència de mitjanes
+dib = bal.tab(ms)
+
+love.plot(bal.tab(ms), threshold = .1)
+```

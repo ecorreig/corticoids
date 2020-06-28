@@ -1,0 +1,69 @@
+---
+title: "grip_data_acq"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(mice)
+```
+
+Acquisition and formatting
+===
+
+```{r}
+grip = read.csv('gripe_propensity.csv')
+```
+
+We start removing useless variables (ID):
+
+```{r}
+grip$ID <- NULL
+```
+
+We start by checking how much missing data there is in every variable:
+
+```{r}
+mis =c()
+for (i in 1:ncol(grip)){
+  print(colnames(grip)[i])
+  mis[i]=sum(is.na(grip[,i])==TRUE)
+  print(mis[i])
+}
+```
+
+We see that we have a considerable amount of missing data in some of the variables. Missing data treatment is a delicate issue and in this case can affect our results. 
+
+First we will remove all variables that have 50% or more of missing data, given that they can be of no use to us: 
+
+```{r}
+treure = which(mis > (nrow(grip)/2))
+cg = grip[,-treure]
+```
+
+So we are now left with 67 variables. 
+
+Let's check the percentage of missing data in each variable:
+
+```{r}
+permis =c()
+for (i in 1:ncol(cg)){
+  print(colnames(cg)[i])
+  permis[i]=sum(is.na(cg[,i])==TRUE)/nrow(cg)
+  print(round(permis[i],2)*100)
+}
+```
+
+We impute the rest of missings:
+
+```{r}
+
+# aquest és el tros que fa imputació de variables, com que tarda molt ja agafem directament el csv imputat
+
+tcg=mice(cg, method = 'rf')
+ttcg=complete(tcg)
+ 
+write.csv(ttcg, 'grip_net.csv')
+
+```
+
